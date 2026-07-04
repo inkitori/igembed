@@ -1,0 +1,9 @@
+name = "igembed"
+main = "worker.js"
+compatibility_date = "2026-06-01"
+
+# When Instagram rotates the GraphQL doc_id, update it here (or in the
+# Cloudflare dashboard under Settings -> Variables) — no code change needed.
+[vars]
+# DOC_ID = "8845758582119845"
+# CACHE_TTL = "3000"
