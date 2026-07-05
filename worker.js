@@ -503,6 +503,28 @@ async function apStatus(code, host, env, ctx) {
 // title = "Full Name (@username)", description = caption, player = the video.
 function embedPage(media, code, igUrl, host) {
   const esc = escapeHtml;
+
+  // Resolution failed entirely: show an intentional-looking card instead of an
+  // empty one. No AP link (the status endpoint 404s for errors anyway) and no
+  // og:video, so Discord renders this as a plain link card — which, unlike
+  // video cards, does display og:description.
+  if (media.error) {
+    const tags = [
+      `<meta charset="utf-8"/>`,
+      `<meta property="og:site_name" content="igembed"/>`,
+      `<meta property="og:url" content="${esc(igUrl)}"/>`,
+      `<meta property="og:title" content="Post unavailable"/>`,
+      `<meta name="twitter:title" content="Post unavailable"/>`,
+      `<meta property="og:description" content="Instagram wouldn't hand over this post — it may be private, deleted, or region-locked. Click through to view it on Instagram."/>`,
+      `<meta name="theme-color" content="#E1306C"/>`,
+    ];
+    return new Response(
+      `<!DOCTYPE html><html><head>${tags.join("\n")}</head>
+<body><a href="${esc(igUrl)}">View on Instagram</a></body></html>`,
+      { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=60" } }
+    );
+  }
+
   const username = media.username ? "@" + media.username : "instagram";
   const title =
     (media.fullName ? `${media.fullName} (${username})` : username) +
