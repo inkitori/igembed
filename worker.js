@@ -432,7 +432,7 @@ async function apStatus(code, host, env, ctx) {
     media.likes != null ? `❤️ ${fmtCount(media.likes)}` : media.likesText ? `❤️ ${media.likesText}` : null,
     media.comments != null ? `💬 ${fmtCount(media.comments)}` : media.commentsText ? `💬 ${media.commentsText}` : null,
   ].filter(Boolean).join(" ");
-  let content = media.caption ? htmlContent(truncate(media.caption, 500)) : "";
+  let content = media.caption ? linkify(htmlContent(truncate(media.caption, 500))) : "";
   if (stats) content += (content ? "<br><br>" : "") + `<b>${stats}</b>`;
 
   const items = media.children && media.children.length ? media.children : [media];
@@ -670,6 +670,17 @@ function htmlContent(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/\n/g, "<br>");
+}
+
+// Turns @mentions and #hashtags in already-escaped caption HTML into links
+// (Discord renders <a> in status content as markdown links). The lookbehinds
+// keep emails and mid-word matches out; a mention can't end with a dot.
+function linkify(s) {
+  return s
+    .replace(/(?<![\w.])@([A-Za-z0-9_.]*[A-Za-z0-9_])/g,
+      '<a href="https://www.instagram.com/$1/">@$1</a>')
+    .replace(/(?<![&\w])#([\p{L}\p{N}_]+)/gu,
+      (_, t) => `<a href="https://www.instagram.com/explore/tags/${encodeURIComponent(t)}/">#${t}</a>`);
 }
 
 function decodeHtml(s) {
