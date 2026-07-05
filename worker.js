@@ -458,17 +458,24 @@ async function apStatus(code, host, env, ctx, page = 1) {
   const totalPages = Math.max(1, Math.ceil(items.length / 4));
   page = Math.min(Math.max(1, page), totalPages);
   const start = (page - 1) * 4;
-  const media_attachments = items.slice(start, start + 4).map((it, i) => {
+  const pageItems = items.slice(start, start + 4);
+  const media_attachments = pageItems.map((it, i) => {
     const n = start + i;
     const idx = media.children ? `/${n + 1}` : "";
-    const isVideo = !!(it.isVideo && (it.videoUrl || media.videoUrl));
+    // Discord's gallery drops video attachments when a status has several —
+    // only images draw in the mosaic. So videos play inline only when they're
+    // alone on the page; otherwise they appear as their thumbnail still.
+    const isVideo = pageItems.length === 1 && !!(it.isVideo && (it.videoUrl || media.videoUrl));
     return {
       id: `${shortcodeToId(code) || code}-${n + 1}`,
       type: isVideo ? "video" : "image",
       url: `https://${host}/${isVideo ? "video" : "image"}/${code}${idx}`,
       preview_url: `https://${host}/image/${code}${idx}`,
       remote_url: null, preview_remote_url: null, text_url: null,
-      description: items.length > 4 ? `Item ${n + 1} of ${items.length}` : null,
+      description:
+        items.length > 4
+          ? `Item ${n + 1} of ${items.length}` + (it.isVideo && !isVideo ? " (video — open post to play)" : "")
+          : null,
       meta: { original: { width: media.width || 720, height: media.height || 1280 } },
     };
   });
