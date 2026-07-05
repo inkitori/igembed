@@ -75,8 +75,17 @@ async function handle(request, env, ctx) {
   // Mastodon REST path (/api/v1/statuses/:id) on the same host; both must
   // answer or Discord falls back to the OG tags. The id is numeric
   // (Mastodon-shaped): the shortcode base64-decoded, converted back losslessly.
+  // Carousel pages ride along as a "pageN" suffix on the numeric id (like
+  // fxTikTok), so Discord's /api/v1 re-fetch lands on the same page.
   m = path.match(/^(?:\/users\/[^/]+\/statuses|\/api\/v1\/statuses)\/([A-Za-z0-9_-]+)/);
-  if (m) return apStatus(/^\d+$/.test(m[1]) ? idToShortcode(m[1]) : m[1], url.host, env, ctx);
+  if (m) {
+    const pm = m[1].match(/^(\d+)(?:page(\d+))?$/);
+    return apStatus(
+      pm ? idToShortcode(pm[1]) : m[1],
+      url.host, env, ctx,
+      pm && pm[2] ? parseInt(pm[2], 10) : 1
+    );
+  }
 
   if (path === "/oembed.json") return oembed(url);
 
@@ -113,7 +122,8 @@ async function handle(request, env, ctx) {
   if (clean && !media.error) {
     return proxyMedia(media.isVideo && media.videoUrl ? "video" : "image", code, 1, request, env, ctx);
   }
-  return embedPage(media, code, igUrl, url.host);
+  const page = Math.max(1, parseInt(url.searchParams.get("page") || "1", 10) || 1);
+  return embedPage(media, code, igUrl, url.host, page);
 }
 
 /* ---------------------------------- resolution ---------------------------------- */
@@ -427,7 +437,7 @@ async function proxyMedia(type, code, index, request, env, ctx) {
 // (@username) as the clickable author line, `content` (HTML; <b>/<br> become
 // markdown) as the body, media_attachments as the inline video/images,
 // created_at as the timestamp, application.name as the footer text.
-async function apStatus(code, host, env, ctx) {
+async function apStatus(code, host, env, ctx, page = 1) {
   const media = await resolveMedia(code, env, ctx);
   if (!media || media.error) return new Response("not found", { status: 404 });
 
@@ -442,25 +452,33 @@ async function apStatus(code, host, env, ctx) {
   let content = media.caption ? linkify(htmlContent(truncate(media.caption, 500))) : "";
   if (stats) content += (content ? "<br><br>" : "") + `<b>${stats}</b>`;
 
+  // Discord shows at most 4 attachments, so long carousels are split into
+  // pages of 4; ?page=N on the post link selects one.
   const items = media.children && media.children.length ? media.children : [media];
-  const media_attachments = items.slice(0, 4).map((it, i) => {
-    const idx = media.children ? `/${i + 1}` : "";
+  const totalPages = Math.max(1, Math.ceil(items.length / 4));
+  page = Math.min(Math.max(1, page), totalPages);
+  const start = (page - 1) * 4;
+  const media_attachments = items.slice(start, start + 4).map((it, i) => {
+    const n = start + i;
+    const idx = media.children ? `/${n + 1}` : "";
     const isVideo = !!(it.isVideo && (it.videoUrl || media.videoUrl));
     return {
-      id: `${shortcodeToId(code) || code}-${i + 1}`,
+      id: `${shortcodeToId(code) || code}-${n + 1}`,
       type: isVideo ? "video" : "image",
       url: `https://${host}/${isVideo ? "video" : "image"}/${code}${idx}`,
       preview_url: `https://${host}/image/${code}${idx}`,
-      remote_url: null, preview_remote_url: null, text_url: null, description: null,
+      remote_url: null, preview_remote_url: null, text_url: null,
+      description: items.length > 4 ? `Item ${n + 1} of ${items.length}` : null,
       meta: { original: { width: media.width || 720, height: media.height || 1280 } },
     };
   });
 
-  const statusId = shortcodeToId(code) || code;
+  const statusId = (shortcodeToId(code) || code) + (page > 1 ? "page" + page : "");
+  const pagedUrl = igUrl + (page > 1 ? `?page=${page}` : "");
   const status = {
     id: statusId,
-    url: igUrl,
-    uri: igUrl,
+    url: pagedUrl,
+    uri: pagedUrl,
     created_at: media.takenAt ? new Date(media.takenAt * 1000).toISOString() : "1970-01-01T00:00:00.000Z",
     content,
     spoiler_text: "",
@@ -501,7 +519,7 @@ async function apStatus(code, host, env, ctx) {
 // the OG/twitter tags are the fallback for every other platform (and for
 // Discord if the status fetch ever fails), shaped like tnktok's fallback:
 // title = "Full Name (@username)", description = caption, player = the video.
-function embedPage(media, code, igUrl, host) {
+function embedPage(media, code, igUrl, host, page = 1) {
   const esc = escapeHtml;
 
   // Resolution failed entirely: show an intentional-looking card instead of an
@@ -545,7 +563,7 @@ function embedPage(media, code, igUrl, host) {
     )}&author_url=${encodeURIComponent(profileUrl)}&link=${encodeURIComponent(igUrl)}" type="application/json+oembed"/>`,
     `<link rel="alternate" type="application/activity+json" href="https://${host}/users/${encodeURIComponent(
       media.username || "instagram"
-    )}/statuses/${shortcodeToId(code) || code}"/>`,
+    )}/statuses/${shortcodeToId(code) || code}${page > 1 ? "page" + page : ""}"/>`,
   ];
 
   if (media.isVideo && media.videoUrl) {
