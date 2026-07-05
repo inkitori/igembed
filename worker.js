@@ -120,7 +120,7 @@ async function handle(request, env, ctx) {
 
 async function resolveMedia(code, env, ctx) {
   const cache = caches.default;
-  const cacheKey = new Request("https://igembed.cache/v3/" + code);
+  const cacheKey = new Request("https://igembed.cache/v4/" + code);
   const hit = await cache.match(cacheKey);
   if (hit) return hit.json();
 
@@ -190,6 +190,7 @@ function normalizeXig(node) {
     imageUrl: pickImage(first),
     username: user.username || null,
     fullName: user.full_name || null,
+    verified: !!user.is_verified,
     profilePicUrl: user.profile_pic_url || null,
     caption: node.caption ? node.caption.text : null,
     takenAt: node.taken_at || null,
@@ -310,7 +311,12 @@ async function fromProfileFeed(username, code) {
   if (!edge) return null;
   return normalizeGql({
     ...edge.node,
-    owner: { username, full_name: user.full_name, profile_pic_url: user.profile_pic_url },
+    owner: {
+      username,
+      full_name: user.full_name,
+      is_verified: user.is_verified,
+      profile_pic_url: user.profile_pic_url,
+    },
   });
 }
 
@@ -364,6 +370,7 @@ function normalizeGql(node) {
     imageUrl: item.display_url || node.display_url || node.thumbnail_src || null,
     username: node.owner ? node.owner.username : null,
     fullName: node.owner ? node.owner.full_name || null : null,
+    verified: !!(node.owner && node.owner.is_verified),
     profilePicUrl: node.owner ? node.owner.profile_pic_url || null : null,
     caption: captionEdges && captionEdges.length ? captionEdges[0].node.text : null,
     takenAt: node.taken_at_timestamp || null,
@@ -463,6 +470,8 @@ async function apStatus(code, host, env, ctx) {
     media_attachments,
     account: {
       id: username,
+      // No verified-badge glyph here: Discord sanitizes check marks (☑️/✅/✓,
+      // all tested) out of author display names, presumably anti-spoofing.
       display_name: media.fullName || username,
       username,
       acct: username,
