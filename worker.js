@@ -639,8 +639,8 @@ function landingPage(host) {
 <body><h1>igembed</h1>
 <p>Fixes Instagram embeds in Discord. Replace <code>www.instagram.com</code> with <code>${host}</code> in any post or reel link:</p>
 <p><code>https://${host}/reel/ABC123/</code></p>
-<p>Crawlers get a proper video embed; everyone else is redirected straight to the post.</p>
-<p>Add <code>/c</code> in front of the path (<code>https://${host}/c/reel/ABC123/</code>) for a clean embed: just the video or image, no caption or author text.</p>
+<p>Add <code>/c</code> in front of the path (<code>https://${host}/c/reel/ABC123/</code>) for a clean embed</p>
+<p><a href="https://github.com/inkitori/igembed">GitHub</a></p>
 </body></html>`,
     { headers: { "Content-Type": "text/html; charset=utf-8" } }
   );
