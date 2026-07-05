@@ -551,9 +551,14 @@ function embedPage(media, code, igUrl, host, page = 1) {
   }
 
   const username = media.username ? "@" + media.username : "instagram";
+  // Discord shows this via oEmbed author_name even on the rich AP embed (the
+  // AP account only supplies the avatar), so only annotate what's true of the
+  // current view: the page position, and only when there are multiple pages.
+  const totalPages = Math.max(1, Math.ceil((media.itemCount || 1) / 4));
+  page = Math.min(Math.max(1, page), totalPages);
   const title =
     (media.fullName ? `${media.fullName} (${username})` : username) +
-    (media.itemCount > 1 ? ` (1/${media.itemCount})` : "");
+    (totalPages > 1 ? ` (${page}/${totalPages})` : "");
   const caption = media.caption ? truncate(media.caption, 220) : "";
   const profileUrl = media.username ? `https://www.instagram.com/${media.username}/` : "https://www.instagram.com";
 
