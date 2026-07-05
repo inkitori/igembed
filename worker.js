@@ -5,10 +5,16 @@
  *   https://www.instagram.com/reel/ABC123/  ->  https://<your-worker>/reel/ABC123/
  *
  * Behavior:
- *   - Discord/Telegram/etc. crawlers get an HTML page with og:video / og:image tags.
+ *   - Discord gets a tnktok/fxTikTok-style rich embed: the HTML page links to a
+ *     Mastodon-status-shaped JSON (`application/activity+json` alternate link)
+ *     that Discord renders with the author's avatar, "Name (@username)", the
+ *     caption, a bold ❤️/💬/▶️ stats line, the post timestamp, and an
+ *     "igembed" footer. Other crawlers (Telegram, Slack, ...) fall back to the
+ *     og:video / og:image tags on the page itself.
  *   - Real people get a 302 straight to the original Instagram post.
- *   - /video/:code and /image/:code proxy the media bytes so Discord never sees
- *     an expired signed CDN URL (the "video shows as an image" failure mode).
+ *   - /video/:code, /image/:code and /pfp/:code proxy the media bytes so
+ *     Discord never sees an expired signed CDN URL (the "video shows as an
+ *     image" failure mode).
  *
  * Media resolution strategies, in order:
  *   1. The post page fetched with a Googlebot UA: Instagram SSRs a complete
@@ -61,8 +67,16 @@ async function handle(request, env, ctx) {
   if (path === "/favicon.ico" || path === "/robots.txt") return new Response(null, { status: 404 });
 
   // Media proxy endpoints (Discord's media proxy hits these; they must always work)
-  let m = path.match(/^\/(video|image)\/([A-Za-z0-9_-]+)(?:\/(\d+))?(?:\.\w+)?$/);
+  let m = path.match(/^\/(video|image|pfp)\/([A-Za-z0-9_-]+)(?:\/(\d+))?(?:\.\w+)?$/);
   if (m) return proxyMedia(m[1], m[2], parseInt(m[3] || "1", 10), request, env, ctx);
+
+  // Mastodon-style status JSON — Discord follows the activity+json alternate
+  // link on the embed page, then re-fetches the status through the canonical
+  // Mastodon REST path (/api/v1/statuses/:id) on the same host; both must
+  // answer or Discord falls back to the OG tags. The id is numeric
+  // (Mastodon-shaped): the shortcode base64-decoded, converted back losslessly.
+  m = path.match(/^(?:\/users\/[^/]+\/statuses|\/api\/v1\/statuses)\/([A-Za-z0-9_-]+)/);
+  if (m) return apStatus(/^\d+$/.test(m[1]) ? idToShortcode(m[1]) : m[1], url.host, env, ctx);
 
   if (path === "/oembed.json") return oembed(url);
 
@@ -84,6 +98,14 @@ async function handle(request, env, ctx) {
   const code = m[2];
   const igUrl = `https://www.instagram.com/${kind}/${code}/`;
 
+  // ?debug returns the resolved media JSON regardless of UA
+  if (url.searchParams.has("debug")) {
+    const media = await resolveMedia(code, env, ctx);
+    return new Response(JSON.stringify(media, null, 2), {
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   // Humans go straight to the real post — no interstitial
   if (!BOT_RE.test(ua)) return Response.redirect(igUrl, 302);
 
@@ -91,16 +113,14 @@ async function handle(request, env, ctx) {
   if (clean && !media.error) {
     return proxyMedia(media.isVideo && media.videoUrl ? "video" : "image", code, 1, request, env, ctx);
   }
-  // ?v=plain renders an alternate layout (no oEmbed, username as title) for A/B
-  // testing in Discord; default is the rich-oEmbed layout.
-  return embedPage(media, code, igUrl, url.host, url.searchParams.get("v") || "");
+  return embedPage(media, code, igUrl, url.host);
 }
 
 /* ---------------------------------- resolution ---------------------------------- */
 
 async function resolveMedia(code, env, ctx) {
   const cache = caches.default;
-  const cacheKey = new Request("https://igembed.cache/v2/" + code);
+  const cacheKey = new Request("https://igembed.cache/v3/" + code);
   const hit = await cache.match(cacheKey);
   if (hit) return hit.json();
 
@@ -159,6 +179,7 @@ async function fetchBotPage(code) {
 
 function normalizeXig(node) {
   const first = (node.carousel_media && node.carousel_media[0]) || node;
+  const user = node.user || node.owner || {};
   const pickVideo = (it) => it.video_versions && it.video_versions[0] && it.video_versions[0].url;
   const pickImage = (it) =>
     (it.image_versions2 && it.image_versions2.candidates && it.image_versions2.candidates[0] &&
@@ -167,13 +188,17 @@ function normalizeXig(node) {
     isVideo: !!pickVideo(first),
     videoUrl: pickVideo(first) || null,
     imageUrl: pickImage(first),
-    username: node.user ? node.user.username : null,
+    username: user.username || null,
+    fullName: user.full_name || null,
+    profilePicUrl: user.profile_pic_url || null,
     caption: node.caption ? node.caption.text : null,
+    takenAt: node.taken_at || null,
     width: first.original_width || null,
     height: first.original_height || null,
     itemCount: node.carousel_media ? node.carousel_media.length : 1,
     likes: node.like_count != null ? node.like_count : null,
     comments: node.comment_count != null ? node.comment_count : null,
+    views: node.play_count ?? node.ig_play_count ?? node.view_count ?? null,
     children: node.carousel_media
       ? node.carousel_media.map((it) => ({
           isVideo: !!pickVideo(it),
@@ -277,13 +302,16 @@ async function fromProfileFeed(username, code) {
   );
   if (!res.ok) return null;
   const data = await res.json().catch(() => null);
+  const user = data && data.data && data.data.user;
   const edges =
-    data && data.data && data.data.user &&
-    data.data.user.edge_owner_to_timeline_media &&
-    data.data.user.edge_owner_to_timeline_media.edges;
+    user && user.edge_owner_to_timeline_media && user.edge_owner_to_timeline_media.edges;
   if (!edges) return null;
   const edge = edges.find((e) => e.node && e.node.shortcode === code);
-  return edge ? normalizeGql({ ...edge.node, owner: { username } }) : null;
+  if (!edge) return null;
+  return normalizeGql({
+    ...edge.node,
+    owner: { username, full_name: user.full_name, profile_pic_url: user.profile_pic_url },
+  });
 }
 
 // Strategy 4: the embed page inlines the GraphQL node as escaped JSON on some
@@ -335,12 +363,16 @@ function normalizeGql(node) {
     videoUrl: item.video_url || null,
     imageUrl: item.display_url || node.display_url || node.thumbnail_src || null,
     username: node.owner ? node.owner.username : null,
+    fullName: node.owner ? node.owner.full_name || null : null,
+    profilePicUrl: node.owner ? node.owner.profile_pic_url || null : null,
     caption: captionEdges && captionEdges.length ? captionEdges[0].node.text : null,
+    takenAt: node.taken_at_timestamp || null,
     width: item.dimensions ? item.dimensions.width : null,
     height: item.dimensions ? item.dimensions.height : null,
     itemCount: children ? children.length : 1,
     likes: likeCount != null ? likeCount : null,
     comments: node.edge_media_to_comment ? node.edge_media_to_comment.count : null,
+    views: node.video_view_count ?? node.video_play_count ?? null,
     children: children
       ? children.map((e) => ({
           isVideo: !!e.node.is_video,
@@ -361,7 +393,10 @@ async function proxyMedia(type, code, index, request, env, ctx) {
 
   const item =
     media.children && media.children[index - 1] ? media.children[index - 1] : media;
-  const target = type === "video" ? item.videoUrl || media.videoUrl : item.imageUrl || media.imageUrl;
+  const target =
+    type === "video" ? item.videoUrl || media.videoUrl :
+    type === "pfp" ? media.profilePicUrl :
+    item.imageUrl || media.imageUrl;
   if (!target) return new Response("no media", { status: 404 });
 
   const fwd = { "User-Agent": CHROME_UA };
@@ -380,73 +415,107 @@ async function proxyMedia(type, code, index, request, env, ctx) {
 
 /* ---------------------------------- pages ---------------------------------- */
 
-// Discord embed anatomy: the oEmbed author_name renders as the white clickable
-// line (@username, linking to the post via author_url) and og:description as
-// the small white body text below it (the caption). The oEmbed must declare
-// type "rich" — with type "link", Discord suppresses og:description on
-// video-player cards (this is why InstaFix, which used "link", had to put the
-// caption in author_name instead). No title meta is set — it would add a big
-// blue duplicate line. Likes/comments are intentionally omitted.
-// variant "plain": no oEmbed at all; username rendered via twitter:title.
-function embedPage(media, code, igUrl, host, variant = "") {
+// The Discord path: a Mastodon-API-status-shaped JSON (what tnktok/fxTikTok
+// serve). Discord renders it as a rich embed — account.avatar + display_name
+// (@username) as the clickable author line, `content` (HTML; <b>/<br> become
+// markdown) as the body, media_attachments as the inline video/images,
+// created_at as the timestamp, application.name as the footer text.
+async function apStatus(code, host, env, ctx) {
+  const media = await resolveMedia(code, env, ctx);
+  if (!media || media.error) return new Response("not found", { status: 404 });
+
+  const igUrl = `https://www.instagram.com/p/${code}/`;
+  const username = media.username || "instagram";
+
+  const stats = [
+    media.views != null ? `▶️ ${fmtCount(media.views)}` : null,
+    media.likes != null ? `❤️ ${fmtCount(media.likes)}` : media.likesText ? `❤️ ${media.likesText}` : null,
+    media.comments != null ? `💬 ${fmtCount(media.comments)}` : media.commentsText ? `💬 ${media.commentsText}` : null,
+  ].filter(Boolean).join(" ");
+  let content = media.caption ? htmlContent(truncate(media.caption, 500)) : "";
+  if (stats) content += (content ? "<br><br>" : "") + `<b>${stats}</b>`;
+
+  const items = media.children && media.children.length ? media.children : [media];
+  const media_attachments = items.slice(0, 4).map((it, i) => {
+    const idx = media.children ? `/${i + 1}` : "";
+    const isVideo = !!(it.isVideo && (it.videoUrl || media.videoUrl));
+    return {
+      id: `${shortcodeToId(code) || code}-${i + 1}`,
+      type: isVideo ? "video" : "image",
+      url: `https://${host}/${isVideo ? "video" : "image"}/${code}${idx}`,
+      preview_url: `https://${host}/image/${code}${idx}`,
+      remote_url: null, preview_remote_url: null, text_url: null, description: null,
+      meta: { original: { width: media.width || 720, height: media.height || 1280 } },
+    };
+  });
+
+  const statusId = shortcodeToId(code) || code;
+  const status = {
+    id: statusId,
+    url: igUrl,
+    uri: igUrl,
+    created_at: media.takenAt ? new Date(media.takenAt * 1000).toISOString() : "1970-01-01T00:00:00.000Z",
+    content,
+    spoiler_text: "",
+    language: null,
+    visibility: "public",
+    application: { name: "igembed", website: `https://${host}` },
+    media_attachments,
+    account: {
+      id: username,
+      display_name: media.fullName || username,
+      username,
+      acct: username,
+      url: `https://www.instagram.com/${username}/`,
+      created_at: media.takenAt ? new Date(media.takenAt * 1000).toISOString() : "1970-01-01T00:00:00.000Z",
+      locked: false, bot: false, discoverable: true, indexable: false, group: false,
+      avatar: media.profilePicUrl ? `https://${host}/pfp/${code}` : null,
+      avatar_static: media.profilePicUrl ? `https://${host}/pfp/${code}` : null,
+      header: null, header_static: null,
+      statuses_count: 0, hide_collections: false, noindex: false,
+      emojis: [], roles: [], fields: [],
+    },
+    mentions: [], tags: [], emojis: [],
+    card: null,
+    poll: null,
+  };
+
+  return new Response(JSON.stringify(status), {
+    headers: {
+      "Content-Type": "application/activity+json; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+// The HTML the crawlers fetch. Discord only uses the activity+json link above;
+// the OG/twitter tags are the fallback for every other platform (and for
+// Discord if the status fetch ever fails), shaped like tnktok's fallback:
+// title = "Full Name (@username)", description = caption, player = the video.
+function embedPage(media, code, igUrl, host) {
   const esc = escapeHtml;
-  const username = media.username ? "@" + media.username : "Instagram";
+  const username = media.username ? "@" + media.username : "instagram";
+  const title =
+    (media.fullName ? `${media.fullName} (${username})` : username) +
+    (media.itemCount > 1 ? ` (1/${media.itemCount})` : "");
   const caption = media.caption ? truncate(media.caption, 220) : "";
-  const handle = username + (media.itemCount > 1 ? ` (1/${media.itemCount})` : "");
+  const profileUrl = media.username ? `https://www.instagram.com/${media.username}/` : "https://www.instagram.com";
+
   const tags = [
     `<meta charset="utf-8"/>`,
     `<meta property="og:site_name" content="igembed"/>`,
     `<meta property="og:url" content="${esc(igUrl)}"/>`,
+    `<meta property="og:title" content="${esc(title)}"/>`,
+    `<meta name="twitter:title" content="${esc(title)}"/>`,
     `<meta property="og:description" content="${esc(caption)}"/>`,
     `<meta name="theme-color" content="#E1306C"/>`,
-  ];
-  const oembedTag = (type, author, provider) =>
     `<link rel="alternate" href="https://${host}/oembed.json?author=${encodeURIComponent(
-      truncate(author, 250)
-    )}${provider ? `&provider=${encodeURIComponent(provider)}` : ""}&type=${type}&link=${encodeURIComponent(
-      igUrl
-    )}" type="application/json+oembed" title="${esc(handle)}"/>`;
-  const stats = [
-    media.likes != null ? `❤️ ${fmtCount(media.likes)}` : null,
-    media.comments != null ? `💬 ${fmtCount(media.comments)}` : null,
-  ].filter(Boolean).join(" ");
-
-  // Layout lab: ?v=<variant> switches tag combos so Discord's rendering of
-  // each can be compared side by side. Default is "a".
-  switch (variant) {
-    case "plain": // username via twitter:title, no oEmbed
-      tags.push(`<meta name="twitter:title" content="${esc(handle)}"/>`);
-      break;
-    case "c": // username via og:title, no oEmbed
-      tags.push(`<meta property="og:title" content="${esc(handle)}"/>`);
-      break;
-    case "d": // og:title + rich oEmbed
-      tags.push(`<meta property="og:title" content="${esc(handle)}"/>`, oembedTag("rich", handle));
-      break;
-    case "e": // link-type oEmbed (InstaFix-era control)
-      tags.push(oembedTag("link", handle));
-      break;
-    case "f": // description only — no title, no oEmbed
-      break;
-    case "g": // full FxTwitter-style: og:title + rich oEmbed with stats provider
-      tags.push(`<meta property="og:title" content="${esc(handle)}"/>`, oembedTag("rich", handle, stats));
-      break;
-    case "h": // username + caption both in the author slot, newline-separated
-      tags.push(oembedTag("rich", handle + "\n" + caption));
-      break;
-    case "i": // username as author, caption as og:title
-      tags.push(`<meta property="og:title" content="${esc(caption || handle)}"/>`, oembedTag("rich", handle));
-      break;
-    case "j": // same as default, kept so old ?v=j test links stay stable
-      tags.push(oembedTag("rich", caption || handle, handle));
-      break;
-    default:
-      // Chosen layout: @username in the small grey provider line (top),
-      // caption in the white author line below it (clickable -> post).
-      // Discord's client never renders og:description on video embeds, so
-      // these two oEmbed slots are the only usable text positions.
-      tags.push(oembedTag("rich", caption || handle, handle));
-  }
+      truncate(title, 250)
+    )}&author_url=${encodeURIComponent(profileUrl)}&link=${encodeURIComponent(igUrl)}" type="application/json+oembed"/>`,
+    `<link rel="alternate" type="application/activity+json" href="https://${host}/users/${encodeURIComponent(
+      media.username || "instagram"
+    )}/statuses/${shortcodeToId(code) || code}"/>`,
+  ];
 
   if (media.isVideo && media.videoUrl) {
     const vurl = `https://${host}/video/${code}`;
@@ -459,7 +528,6 @@ function embedPage(media, code, igUrl, host, variant = "") {
       `<meta property="og:video:width" content="${w}"/>`,
       `<meta property="og:video:height" content="${h}"/>`,
       `<meta property="og:image" content="https://${host}/image/${code}"/>`,
-      `<meta name="twitter:card" content="player"/>`,
       `<meta name="twitter:player:width" content="${w}"/>`,
       `<meta name="twitter:player:height" content="${h}"/>`,
       `<meta name="twitter:player:stream" content="${vurl}"/>`,
@@ -477,8 +545,10 @@ function embedPage(media, code, igUrl, host, variant = "") {
     if (media.height) tags.push(`<meta property="og:image:height" content="${media.height}"/>`);
   }
 
-  const html = `<!DOCTYPE html><html><head>${tags.join("\n")}
-<meta http-equiv="refresh" content="0;url=${esc(igUrl)}"/></head>
+  // No meta-refresh here: humans are 302'd server-side before this renders,
+  // and a refresh tag can make crawlers treat the page as a redirect and skip
+  // the activity+json link. Bots are the only audience for this HTML.
+  const html = `<!DOCTYPE html><html><head>${tags.join("\n")}</head>
 <body><a href="${esc(igUrl)}">View on Instagram</a></body></html>`;
 
   return new Response(html, {
@@ -488,15 +558,14 @@ function embedPage(media, code, igUrl, host, variant = "") {
 
 function oembed(url) {
   const author = url.searchParams.get("author") || "Instagram";
-  const provider = url.searchParams.get("provider") || "";
-  const link = url.searchParams.get("link") || "https://www.instagram.com";
   return new Response(
     JSON.stringify({
       version: "1.0",
-      type: url.searchParams.get("type") || "rich",
-      author_name: author,   // @username (white line), clickable -> post
-      author_url: link,
-      provider_name: provider,
+      type: "link",
+      author_name: author, // "Full Name (@username)", clickable -> profile
+      author_url: url.searchParams.get("author_url") || "https://www.instagram.com",
+      provider_name: "igembed",
+      title: "Instagram post",
     }),
     { headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=3600" } }
   );
@@ -566,10 +635,41 @@ function extractBalancedEscapedJson(s, from) {
   return null;
 }
 
+// Instagram shortcodes are the numeric media ID in URL-safe base64. Discord
+// only treats a /users/:u/statuses/:id link as a Mastodon status when the id
+// looks Mastodon-like (numeric), so the AP URLs carry the decoded form.
+const SC_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+function shortcodeToId(code) {
+  let n = 0n;
+  for (const ch of code.slice(0, 11)) {
+    const v = SC_ALPHA.indexOf(ch);
+    if (v === -1) return null;
+    n = n * 64n + BigInt(v);
+  }
+  return n.toString();
+}
+
+function idToShortcode(id) {
+  let n = BigInt(id), s = "";
+  while (n > 0n) {
+    s = SC_ALPHA[Number(n % 64n)] + s;
+    n /= 64n;
+  }
+  return s || "A";
+}
+
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/\n/g, " ");
+}
+
+// Like escapeHtml but keeps newlines as <br> — for the status `content` field.
+function htmlContent(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/\n/g, "<br>");
 }
 
 function decodeHtml(s) {

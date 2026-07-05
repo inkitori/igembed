@@ -2,9 +2,11 @@
 
 A lightweight Instagram embed fixer for Discord, running as a single-file
 Cloudflare Worker. Replace `www.instagram.com` with your worker domain in any
-post/reel link and Discord renders a real video embed with username, caption,
-and like/comment counts. Anyone who clicks the link is 302-redirected straight
-to the original Instagram post — no interstitial.
+post/reel link and Discord renders a tnktok/fxTikTok-style rich embed: the
+author's profile picture and "Name (@username)" (clickable to the profile),
+the caption, a bold ❤️/💬 stats line, the post's timestamp, and the video
+playing inline. Anyone who clicks the link is 302-redirected straight to the
+original Instagram post — no interstitial.
 
 ```
 https://www.instagram.com/reel/ABC123/  ->  https://igembed.<you>.workers.dev/reel/ABC123/
@@ -32,12 +34,20 @@ https://igembed.<you>.workers.dev/reel/ABC123/?c
 
 ## How it works
 
-- **Crawlers** (Discord, Telegram, Slack, …, detected by User-Agent) get an
-  HTML page with `og:video` / `og:image` tags plus an oEmbed author line.
+- **Discord** follows the page's `application/activity+json` alternate link to
+  a Mastodon-status-shaped JSON (`/users/:user/statuses/:id`) and renders it as
+  a rich fediverse embed — avatar, clickable author, caption body, stats,
+  timestamp, footer. Discord verifies the status by re-fetching it through the
+  canonical Mastodon REST path `/api/v1/statuses/:id` on the same host, so the
+  worker serves both routes. The status id must be numeric: it's the shortcode
+  base64-decoded to Instagram's media ID (losslessly convertible back).
+- **Other crawlers** (Telegram, Slack, …, detected by User-Agent) use the
+  `og:video` / `og:image` tags on the page itself, plus an oEmbed author line.
 - **Everyone else** gets a 302 to the real post.
-- **`/video/:code` and `/image/:code`** proxy the media bytes through the
-  worker, re-resolving on demand, so Discord never caches an expired signed
-  CDN URL (the "video shows up as an image" failure mode of other fixers).
+- **`/video/:code`, `/image/:code` and `/pfp/:code`** proxy the media bytes
+  through the worker, re-resolving on demand, so Discord never caches an
+  expired signed CDN URL (the "video shows up as an image" failure mode of
+  other fixers).
 
 Media data is resolved by trying, in order:
 
